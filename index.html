@@ -1,12 +1,462 @@
 <!doctype html>
-<html lang="en">
-<head>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          }
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (!handledByArtifact && fragment !== "") scrollToFragment(fragment);
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const [header, base64Data] = href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Hands-on training route</title>
+<title>Hands-on training tracker</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&amp;family=Instrument+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
 <style>
 :root{
   --bg:#EEF2F7; --surface:#FFFFFF; --ink:#12213A; --mute:#5B6B84; --line:#D6DEEA; --late:#C2261B; --on:#FFFFFF;
@@ -183,16 +633,22 @@ h1,h2,h3{font-family:"Bricolage Grotesque","Instrument Sans",system-ui,sans-seri
   .cell{min-width:0;padding:6px}
   .cell b{font-size:13px}
 }
+.filenote{margin:-10px 0 18px;font-size:13px;color:var(--mute)}
+#savebar{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(18px + env(safe-area-inset-bottom,0px));z-index:58;display:flex;gap:14px;align-items:center;background:var(--surface);border:2px solid var(--ink);border-radius:16px;padding:8px 10px 8px 18px;font-weight:500;box-shadow:0 10px 30px rgba(10,20,40,.25)}
+#savebar[hidden]{display:none}
+body.dirty .toast{bottom:calc(88px + env(safe-area-inset-bottom,0px))}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html">
 <div class="wrap" id="app"></div>
-<div class="menu" id="menu" role="menu" hidden></div>
-<div class="toast" id="toast" role="status" aria-live="polite" hidden><span id="toastMsg"></span><button class="btn" data-act="undo">Undo</button></div>
+<div class="menu" id="menu" role="menu" hidden=""></div>
+<div id="savebar" role="status" hidden=""></div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden=""><span id="toastMsg"></span><button class="btn" data-act="undo">Undo</button></div>
 
-<div class="cal" id="cal" role="dialog" aria-label="Choose dates" hidden></div>
+<div class="cal" id="cal" role="dialog" aria-label="Choose dates" hidden=""></div>
 
+<script type="application/json" id="tracker-data">{"docId":"ef2b957c-1008-4e0b-9d94-102c29d5fd87","rev":3,"savedAt":"2026-10-01T09:01:27.760Z","state":{"v":4,"start":"2026-09-28","people":["Ram","Abdul","Nael","Anurag"],"labs":[{"id":"a","name":"AI Carts","c":0,"days":7,"items":[{"id":"8z454ln","name":"Collaborative Robot (myBuddy 280)","note":"","from":"","due":"","p":[2,2,2]},{"id":"jk0dgan","name":"Portable Exoskeleton Robot Controller (myController S570)","note":"Data capture accessory for the myBuddy 280","from":"","due":"","p":[2,2,2]},{"id":"bjdx4c6","name":"Mini Humanoid (Robosen K1)","note":"","from":"","due":"","p":[3,3,3]},{"id":"o60sphm","name":"3D Printer (P1 Series)","note":"","from":"","due":"","p":[3,3,3]},{"id":"j6ydpc9","name":"AI Robotic Kit (uKit Advanced)","note":"","from":"","due":"","p":[3,3,3]},{"id":"xymjqjy","name":"AI Robotic Wheel Bot (VinciBot)","note":"","from":"","due":"","p":[3,3,3]},{"id":"yic3dbk","name":"AIO PC (IdeaCentre AIO 24)","note":"","from":"","due":"","p":[3,3,3]}]},{"id":"q","name":"Quantum Lab","c":1,"days":15,"items":[{"id":"33rcak4","name":"Humanoid (G1 EDU Ultimate C)","note":"","from":"","due":"","p":[0,0,0]},{"id":"2dqqn3o","name":"Quadruped with wheels (Go2-W)","note":"","from":"","due":"","p":[0,0,0]},{"id":"kntbjzz","name":"Quantum (Gemini Mini)","note":"","from":"","due":"","p":[0,0,0]},{"id":"zit5gyj","name":"Bike (customised research version, Founder Edition)","note":"","from":"","due":"","p":[0,0,0]},{"id":"wz639j7","name":"AI robot city (AI-HUB, customised with gripper arm)","note":"","from":"","due":"","p":[0,0,0]},{"id":"xpvhz1u","name":"Podcast Studio","note":"","from":"","due":"","p":[0,0,0]},{"id":"sh9nmhh","name":"Drone Classroom Pack (CoDrone EDU)","note":"","from":"","due":"","p":[3,3,0]},{"id":"70ukn8a","name":"Simulator + PC + Software + Triple Monitor (Boeing flight simulator)","note":"","from":"","due":"","p":[0,0,0]},{"id":"8mhaees","name":"Zero Gravity (Werkstation 10)","note":"","from":"","due":"","p":[0,0,0]},{"id":"cjxolye","name":"Immersive Room","note":"","from":"","due":"","p":[0,0,0]},{"id":"66ghy2n","name":"EEG (Epoc X)","note":"","from":"","due":"","p":[0,0,0]},{"id":"u8xo90t","name":"Ozobot classroom kit (Ari)","note":"","from":"","due":"","p":[0,3,0]}]},{"id":"m","name":"MobileX","c":2,"days":20,"items":[{"id":"k6y281y","name":"AI Race Track","note":"","from":"","due":"","p":[0,0,0]},{"id":"cwcra7k","name":"Magician Go Cars Setup","note":"","from":"","due":"","p":[0,3,0,0]},{"id":"x1r1dl5","name":"Pitops","note":"","from":"","due":"","p":[0,3,0,0]},{"id":"5rms25v","name":"Industrial 3D Printer","note":"","from":"","due":"","p":[0,0,0]},{"id":"5vng1x0","name":"3D Printer (P2S)","note":"","from":"","due":"","p":[3,3,3]},{"id":"a5n0i32","name":"Wind Tunnel","note":"","from":"","due":"","p":[0,0,0]},{"id":"qhughc0","name":"Router (MCR 100)","note":"","from":"","due":"","p":[0,0,0]},{"id":"rifoikc","name":"F1 Track (Race System Package Halo)","note":"","from":"","due":"","p":[0,0,0]},{"id":"vmgkd3k","name":"EduKart (customised)","note":"","from":"","due":"","p":[0,0,0]},{"id":"ikqxgl9","name":"Humanoid (Booster K1)","note":"","from":"","due":"","p":[0,0,0]},{"id":"ewi19tx","name":"Infento (Pro Kit 2)","note":"","from":"","due":"","p":[0,0,0]},{"id":"fq0cat3","name":"Automobile Physical Simulation Models","note":"Working miniature models: jet engine, V12 and car engines","from":"","due":"","p":[0,0,0]},{"id":"viictpb","name":"Magician Mini Car Assembly Line (customised)","note":"","from":"","due":"","p":[0,0,0,0]}]},{"id":"d","name":"DollarX","c":3,"days":5,"items":[{"id":"ozz80xw","name":"LED Ticker","note":"Customised, shows live Nasdaq market data","from":"","due":"","p":[0,0,0]},{"id":"5l76c88","name":"Curriculum & Software","note":"Financial literacy games for students","from":"","due":"","p":[0,0,0]},{"id":"yew7v13","name":"Finance Kit (customised)","note":"Board games, financial instruments, cheques, debit cards","from":"","due":"","p":[0,0,0]}]},{"id":"x","name":"XREAL","c":4,"days":10,"items":[{"id":"moutnjv","name":"VR Treadmill (Omni One)","note":"","from":"","due":"","p":[0,0,0]},{"id":"r0pl35h","name":"VR Headsets (Quest 3S)","note":"","from":"","due":"","p":[0,0,0]},{"id":"gmnzmjm","name":"MergeCube","note":"","from":"","due":"","p":[3,3,0,0]},{"id":"c0siesk","name":"Simulation Software","note":"","from":"","due":"","p":[0,0,0]}]},{"id":"pzcfx0v","name":"Strike","c":5,"days":5,"items":[{"id":"un65gid","name":"Gaming PC","note":"","from":"","due":"","p":[]},{"id":"loeed5j","name":"Streaming Setup","note":"","from":"","due":"","p":[]},{"id":"cwsez1u","name":"Simulator PC","note":"","from":"","due":"","p":[]},{"id":"caqcl3p","name":"Simulator Software","note":"","from":"","due":"","p":[]}]}]}}</script>
 <script>
 (function(){
 var STAGES=["To do","Explored","Hands-on","Signed off"];
@@ -262,23 +718,34 @@ function norm(o){
 }
 
 var plan={},sel={};
-var S=norm(null),hist=[],focus=null,edit=false,ref=null,shared=false,touched=false,timer=null,toastT=null,pendingFocus=null;
-try{
-  var r3=localStorage.getItem(KEY3),r2=localStorage.getItem(KEY2);
-  if(r3)S=norm(JSON.parse(r3));else if(r2)S=norm(JSON.parse(r2));
-}catch(e){}
+function clone(o){return JSON.parse(JSON.stringify(o))}
+var EMB={};try{EMB=JSON.parse(document.getElementById("tracker-data").textContent)||{}}catch(e){}
+var SRC="<!doctype html>\n"+document.documentElement.outerHTML;   /* this file's own source, used for the download fallback */
+var docId=EMB.docId||"tracker",loadedRev=EMB.rev||0,lastSavedAt=EMB.savedAt||"";
+var DKEY="sunmarke-tracker-draft-"+docId;
+var FS_OK=!!(window.showOpenFilePicker&&window.isSecureContext!==false);
+var S=norm(EMB.state||null),base=clone(S),hist=[],focus=null,edit=false,toastT=null,pendingFocus=null,dirty=false,saving=false,restored=false,fileHandle=null;
+try{var dr=JSON.parse(localStorage.getItem(DKEY)||"null");if(dr&&dr.baseRev===loadedRev&&dr.state){S=norm(dr.state);dirty=true;restored=true}}catch(e){}
 
 function snap(){hist.push(JSON.stringify(S));if(hist.length>60)hist.shift()}
 function persist(){
-  touched=true;
-  try{localStorage.setItem(KEY3,JSON.stringify(S))}catch(e){}
-  if(ref){clearTimeout(timer);timer=setTimeout(function(){ref.set(JSON.parse(JSON.stringify(S))).catch(function(){})},400)}
+  dirty=true;
+  try{localStorage.setItem(DKEY,JSON.stringify({baseRev:loadedRev,state:S}))}catch(e){}
+  updateSaveBar();
 }
-function toast(msg){
+function toast(msg,info){
   document.getElementById("toastMsg").textContent=msg;
-  var t=document.getElementById("toast");t.hidden=false;
-  clearTimeout(toastT);toastT=setTimeout(function(){t.hidden=true},8000);
+  var t=document.getElementById("toast");t.querySelector(".btn").hidden=!!info;t.hidden=false;
+  clearTimeout(toastT);toastT=setTimeout(function(){t.hidden=true},info?6000:8000);
 }
+function fmtStamp(iso){try{return new Date(iso).toLocaleString([],{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})}catch(e){return ""}}
+function fileNote(){
+  var s=lastSavedAt?"File last saved "+fmtStamp(lastSavedAt)+". ":"";
+  if(fileHandle)return s+"Saving into "+fileHandle.name+".";
+  return s+(FS_OK?"The first save asks you to choose this file.":"This browser cannot write to the file, so Save downloads an updated copy.");
+}
+function footText(){return "Edits stay on this page until you click Save to file."}
+function fileName(){var p=decodeURIComponent((location.pathname||"").split("/").pop()||"");return /\.html?$/i.test(p)?p:"training-tracker.html"}
 function labById(id){for(var i=0;i<S.labs.length;i++)if(S.labs[i].id===id)return S.labs[i]}
 function itemById(L,id){if(!L)return;for(var i=0;i<L.items.length;i++)if(L.items[i].id===id)return L.items[i]}
 function stage(it,p){return +it.p[p]||0}
@@ -330,9 +797,10 @@ function render(){
 
   h+='<header class="head"><h1>Hands-on training route</h1><p>'+esc(nameList(S.people))+' work through every lab one product at a time: explore it, run it, then sign it off.</p></header>';
   h+='<div class="bar"><label class="start">Training starts<input type="date" id="start" value="'+esc(S.start)+'"></label><span class="spacer"></span>'
+   +'<button class="btn primary" data-act="save">Save to file</button><button class="btn" data-act="latest">Get latest</button>'
    +'<button class="btn" data-act="undo"'+(hist.length?'':' disabled')+'>Undo</button>'
    +'<button class="btn" data-act="reset">Clear all progress</button>'
-   +'<button class="btn'+(edit?' primary':'')+'" data-act="edit" aria-pressed="'+edit+'">'+(edit?'Done editing':'Edit sheet')+'</button></div>';
+   +'<button class="btn'+(edit?' primary':'')+'" data-act="edit" aria-pressed="'+edit+'">'+(edit?'Done editing':'Edit sheet')+'</button></div><p class="filenote">'+esc(fileNote())+'</p>';
 
   var status=C.today<C.first?"Starts "+fmtL.format(C.first):(C.today>C.last?"Planned window has ended":"In progress");
   h+='<p class="summary"><span><b>'+pc(C.pct)+'</b>complete</span><span><b>'+C.full+' of '+C.nItems+'</b>products signed off by everyone</span>'
@@ -437,7 +905,7 @@ function render(){
     h+='</section>';
   });
   if(edit)h+='<button class="btn" data-act="addLab">Add lab</button>';
-  h+='<p class="foot">'+(shared?'Changes are saved for everyone with access to this page.':'Changes are saved on this device.')+' Working days are Monday to Friday.</p>';
+  h+='<p class="foot">'+footText()+' Working days are Monday to Friday.</p>';
   document.getElementById("app").innerHTML=h;
   if(pendingFocus){var el=document.querySelector(pendingFocus);if(el){el.focus();if(el.select)el.select()}pendingFocus=null}
 }
@@ -544,6 +1012,8 @@ document.addEventListener("click",function(e){
   if(!menu.hidden){var same=b&&b===menuAnchor;closeMenu();if(same)return}
   if(!cal.hidden){var sameC=b&&b===calAnchor;closeCal();if(sameC)return}
   if(!b)return;
+  if(act==="save"){saveToFile();return}
+  if(act==="latest"){getLatest(false);return}
   var lid=b.getAttribute("data-lab"),iid=b.getAttribute("data-item"),p=+b.getAttribute("data-p"),L=lid&&lid!=="all"?labById(lid):null,it=L?itemById(L,iid):null;
 
   if(act==="focus"){focus=lid;render();return}
@@ -609,33 +1079,142 @@ document.addEventListener("change",function(e){
   if(f==="selall"&&L){sel[L.id]={};if(t.checked)L.items.forEach(function(i2){sel[L.id][i2.id]=true});pendingFocus='[data-f="selall"][data-lab="'+L.id+'"]';render()}
 });
 
-if(needsPersist){needsPersist=false;persist()}
-render();
+render();updateSaveBar();
+if(restored)toast("Restored your unsaved changes from this browser.",true);
 
-/* shared saving lights up when available */
-try{
-  if(window.claude&&window.claude.use){
-    window.claude.use("db").then(function(db){
-      if(!db)return;
-      ref=db.doc("tracker/state_v3");shared=true;
-      ref.onSnapshot(function(s){
-        if(s.metadata&&s.metadata.hasPendingWrites)return;
-        if(s.exists){
-          var n=norm(s.data());
-          if(needsPersist){needsPersist=false;S=n;persist();render()}
-          else if(JSON.stringify(n)!==JSON.stringify(S)){S=n;render()}
-        }else if(!touched){
-          /* first run on this version: carry over progress from the earlier version if it exists */
-          db.doc("tracker/state_v2").get().then(function(o){
-            if(o.exists&&!touched){S=norm(o.data());persist();render()}
-          }).catch(function(){});
-        }
-        var f=document.querySelector(".foot");if(f)f.firstChild.textContent="Changes are saved for everyone with access to this page.";
-      },function(){shared=false;ref=null;render()});
-    }).catch(function(){});
+/* ---------- combine edits made by different people ---------- */
+function mergeState(b,m,t){
+  var same=function(x,y){return JSON.stringify(x)===JSON.stringify(y)};
+  var pick=function(bv,mv,tv){return same(mv,bv)?tv:mv};
+  function mergeList(bA,mA,tA,fn){
+    var bi={},mi={},ti={},out=[],order=[];
+    (bA||[]).forEach(function(x){bi[x.id]=x});(mA||[]).forEach(function(x){mi[x.id]=x});(tA||[]).forEach(function(x){ti[x.id]=x});
+    (tA||[]).forEach(function(x){order.push(x.id)});
+    (mA||[]).forEach(function(x){if(!ti[x.id]&&!bi[x.id])order.push(x.id)});
+    order.forEach(function(id){
+      var bb=bi[id],mm=mi[id],tt=ti[id];
+      if(tt&&mm&&bb)out.push(fn(bb,mm,tt));
+      else if(tt&&!mm&&!bb)out.push(tt);
+      else if(tt&&mm&&!bb)out.push(tt);
+      else if(!tt&&mm&&!bb)out.push(mm);
+      /* deleted by either side: stays deleted */
+    });
+    return out;
   }
-}catch(e){}
+  function item(bb,mm,tt){
+    var o={id:tt.id,name:pick(bb.name,mm.name,tt.name),note:pick(bb.note,mm.note,tt.note),from:pick(bb.from,mm.from,tt.from),due:pick(bb.due,mm.due,tt.due),p:[]};
+    var n=Math.max(bb.p.length,mm.p.length,tt.p.length);
+    for(var i=0;i<n;i++)o.p.push(pick(bb.p[i]||0,mm.p[i]||0,tt.p[i]||0));
+    return o;
+  }
+  function lab(bb,mm,tt){return{id:tt.id,name:pick(bb.name,mm.name,tt.name),c:pick(bb.c,mm.c,tt.c),days:pick(bb.days,mm.days,tt.days),items:mergeList(bb.items,mm.items,tt.items,item)}}
+  return{v:4,start:pick(b.start,m.start,t.start),people:pick(b.people,m.people,t.people),labs:mergeList(b.labs,m.labs,t.labs,lab)};
+}
+
+/* ---------- saving into the HTML file itself ---------- */
+function embedJson(rev,state){return JSON.stringify({docId:docId,rev:rev,savedAt:new Date().toISOString(),state:state}).replace(/</g,"\\u003c")}
+function buildHtml(src,rev,state){
+  var re=/(<script type="application\/json" id="tracker-data">)[\s\S]*?(<\/script>)/;
+  if(!re.test(src))throw new Error("that file has no tracker data section");
+  return src.replace(re,function(m,a,b){return a+embedJson(rev,state)+b});
+}
+function parseEmbedded(txt){
+  var m=txt.match(/<script type="application\/json" id="tracker-data">([\s\S]*?)<\/script>/);
+  if(!m)return null;
+  try{return JSON.parse(m[1])}catch(e){return null}
+}
+function updateSaveBar(){
+  var el=document.getElementById("savebar");
+  if(dirty){el.hidden=false;el.innerHTML='<span>You have unsaved changes</span><button class="btn primary" data-act="save">Save to file</button>';document.body.classList.add("dirty")}
+  else{el.hidden=true;document.body.classList.remove("dirty")}
+  var fn=document.querySelector(".filenote");if(fn)fn.textContent=fileNote();
+}
+function softRender(){
+  var a=document.activeElement;
+  if(a&&a.matches&&a.matches("#app input[data-f]")&&a.type!=="checkbox"){setTimeout(softRender,1500);return}
+  render();
+}
+function idb(){return new Promise(function(res,rej){var r=indexedDB.open("tracker-fs",1);r.onupgradeneeded=function(){r.result.createObjectStore("h")};r.onsuccess=function(){res(r.result)};r.onerror=function(){rej(r.error)}})}
+async function rememberHandle(h){try{var d=await idb();d.transaction("h","readwrite").objectStore("h").put(h,docId)}catch(e){}}
+async function recallHandle(){
+  try{var d=await idb();return await new Promise(function(res){var q=d.transaction("h").objectStore("h").get(docId);q.onsuccess=function(){res(q.result||null)};q.onerror=function(){res(null)}})}catch(e){return null}
+}
+async function pickFile(){
+  var hs=await window.showOpenFilePicker({multiple:false,types:[{description:"Tracker page",accept:{"text/html":[".html",".htm"]}}]});
+  var h=hs[0],txt=await (await h.getFile()).text(),emb=parseEmbedded(txt);
+  if(!emb||(emb.docId&&emb.docId!==docId))throw new Error("that is not this tracker file. Choose the file this page was opened from.");
+  return h;
+}
+async function ensureAccess(h,mode){
+  var o={mode:mode};
+  if((await h.queryPermission(o))==="granted")return true;
+  return (await h.requestPermission(o))==="granted";
+}
+function downloadCopy(){
+  var rev=loadedRev+1,out=buildHtml(SRC,rev,S);
+  var blob=new Blob([out],{type:"text/html"}),a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);a.download=fileName();document.body.appendChild(a);a.click();a.remove();
+  setTimeout(function(){URL.revokeObjectURL(a.href)},3000);
+  loadedRev=rev;base=clone(S);dirty=false;lastSavedAt=new Date().toISOString();
+  try{localStorage.removeItem(DKEY)}catch(e){}
+  render();updateSaveBar();
+  toast("Downloaded an updated copy. Replace the old file with it.",true);
+}
+async function saveToFile(){
+  if(saving)return;saving=true;
+  try{
+    if(!FS_OK){downloadCopy();return}
+    if(!fileHandle){fileHandle=await pickFile();await rememberHandle(fileHandle)}
+    if(!(await ensureAccess(fileHandle,"readwrite")))throw new Error("permission to change the file was not given");
+    var txt=await (await fileHandle.getFile()).text(),disk=parseEmbedded(txt),merged=false;
+    if(disk&&disk.docId&&disk.docId!==docId)throw new Error("the file on disk is a different tracker");
+    if(disk&&disk.rev>loadedRev){var th=norm(disk.state);S=mergeState(base,S,th);base=th;loadedRev=disk.rev;merged=true;hist=[]}
+    var rev=loadedRev+1,out=buildHtml(txt,rev,S);
+    var w=await fileHandle.createWritable();await w.write(out);await w.close();
+    loadedRev=rev;base=clone(S);dirty=false;lastSavedAt=new Date().toISOString();
+    try{localStorage.removeItem(DKEY)}catch(e){}
+    render();updateSaveBar();
+    toast(merged?"Saved. Changes made by someone else were combined in.":"Saved to "+fileHandle.name+".",true);
+  }catch(e){
+    if(e&&e.name==="AbortError")return;
+    if(e&&e.name==="SecurityError"){FS_OK=false;try{downloadCopy()}catch(e2){toast("Could not save: "+e2.message,true)}return}
+    toast("Could not save: "+((e&&e.message)||e),true);
+  }finally{saving=false}
+}
+function pickViaInput(){
+  return new Promise(function(res){
+    var i=document.createElement("input");i.type="file";i.accept=".html,.htm";
+    i.onchange=function(){var f=i.files&&i.files[0];if(!f){res(null);return}f.text().then(res)};
+    i.click();
+  });
+}
+function applyDisk(txt,silent){
+  var disk=parseEmbedded(txt);
+  if(!disk||(disk.docId&&disk.docId!==docId)){if(!silent)toast("That file is not this tracker.",true);return}
+  if(disk.rev<=loadedRev){if(!silent)toast("You already have the latest version.",true);return}
+  var th=norm(disk.state);
+  S=mergeState(base,S,th);base=th;loadedRev=disk.rev;hist=[];lastSavedAt=disk.savedAt||lastSavedAt;
+  dirty=JSON.stringify(S)!==JSON.stringify(base);
+  if(dirty)persist();else{try{localStorage.removeItem(DKEY)}catch(e){}}
+  softRender();updateSaveBar();
+  toast(silent?"Updated with changes saved by someone else.":"Loaded the latest changes.",true);
+}
+async function getLatest(silent){
+  try{
+    var txt=null;
+    if(FS_OK&&fileHandle){
+      if(silent){if((await fileHandle.queryPermission({mode:"read"}))!=="granted")return}
+      else if(!(await ensureAccess(fileHandle,"read")))return;
+      txt=await (await fileHandle.getFile()).text();
+    }else if(FS_OK&&!silent){
+      fileHandle=await pickFile();await rememberHandle(fileHandle);updateSaveBar();
+      txt=await (await fileHandle.getFile()).text();
+    }else if(!silent){txt=await pickViaInput()}
+    if(txt)applyDisk(txt,silent);
+  }catch(e){if(!silent&&!(e&&e.name==="AbortError"))toast("Could not read the file: "+((e&&e.message)||e),true)}
+}
+if(FS_OK)recallHandle().then(function(h){if(h){fileHandle=h;updateSaveBar()}});
+setInterval(function(){if(!document.hidden&&fileHandle&&!saving)getLatest(true)},20000);
+window.addEventListener("beforeunload",function(e){if(dirty){e.preventDefault();e.returnValue=""}});
 })();
-</script>
-</body>
-</html>
+</script></body></html>
